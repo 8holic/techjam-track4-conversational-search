@@ -1,3 +1,26 @@
+Analyiss of the default BM25
+
+It does not ask questions, and rescores suign the same message
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # TechJam Conversational E-Commerce Search Challenge
 
 Build an AI shopping agent that asks useful follow-up questions and recommends the customer's hidden target product within at most 10 turns.
