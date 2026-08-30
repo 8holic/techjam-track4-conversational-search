@@ -44,6 +44,7 @@ OVERLOAD_POOL = 5000
 VARIANCE_ALPHA = 0.3
 BASE_PRESSURE_BROWSE = 0.5
 CONFIRMED_AXIS_BOOST = 1.5
+PROFILE_SEED_BOOST = 0.5
 SWITCH_SLOTS = 2
 CONVERGE_COUNT = 25
 
@@ -146,7 +147,7 @@ class Agent:
         for tag in tags:
             bucket = TAG_TO_BUCKET.get(tag)
             if bucket in weights:
-                weights[bucket] += 0.5
+                weights[bucket] += PROFILE_SEED_BOOST
         self._sessions[session_id] = {
             "confirmed": [],
             "confirmed_axis": set(),
@@ -158,13 +159,20 @@ class Agent:
             "track": None,
             "weights": weights,
             "pool": self._total,
+            "distilled": None,
         }
 
     def _add_constraint(self, state: dict, text: str, provisional: bool) -> None:
         text = text.strip().strip(".")
         if text and not any(text == existing for existing, _ in state["confirmed"]):
             state["confirmed"].append((text, provisional))
-            state["confirmed_axis"].add(_classify(text))
+            axis = _classify(text)
+            state["confirmed_axis"].add(axis)
+            # ADAPTIVE MEMORY (Pillar III): every confirmed fact updates the live
+            # user model -- the revealed axis is boosted so the model reflects
+            # what the customer actually engaged with.
+            if axis in state["weights"]:
+                state["weights"][axis] = min(2.0, state["weights"][axis] + 0.25)
 
     def _absorb(self, state: dict, message: str) -> None:
         message = message.strip()
@@ -302,6 +310,18 @@ class Agent:
             score *= CONFIRMED_AXIS_BOOST
         return score
 
+    def _distill(self, state: dict) -> dict:
+        # ADAPTIVE MEMORY (Pillar III): personalized context distillation -- a
+        # compact live user model consumed by the ask/rank logic and later by an
+        # LLM context (Dynamic Context Programming).
+        return {
+            "track": state["track"],
+            "category": " ".join(state["category_terms"]),
+            "engaged_axes": sorted(state["confirmed_axis"]),
+            "confirmed_count": len(state["confirmed"]),
+            "weights": {k: round(v, 2) for k, v in state["weights"].items()},
+        }
+
     def _next_ask(self, state: dict) -> str | None:
         candidates = [
             bucket for bucket in DEFAULT_BUCKETS
@@ -331,13 +351,19 @@ class Agent:
 
         recommendations, candidate_count = self._rank(state, top_k)
         state["pool"] = candidate_count
+        state["distilled"] = self._distill(state)
         converged = len(state["confirmed"]) >= 2 and candidate_count <= CONVERGE_COUNT
         ask_attribute = None if (turn >= 9 or converged) else self._next_ask(state)
         if ask_attribute is not None:
             state["asked"].add(ask_attribute)
 
+        focus = state["distilled"]["engaged_axes"]
+        if focus:
+            message = f"I'm narrowing on {', '.join(focus)}. Here are my current best matches."
+        else:
+            message = "Here are my current best matches."
         return {
-            "message": "Here are my current best matches.",
+            "message": message,
             "ask_attribute": ask_attribute,
             "recommendations": recommendations,
             "usage": {"prompt_tokens": 0, "completion_tokens": 0},
