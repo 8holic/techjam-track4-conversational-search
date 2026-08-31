@@ -2,10 +2,25 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sqlite3
 from collections import Counter
 from pathlib import Path
+
+try:
+    from starter.llm import (
+        MAX_LLM_CALLS, RERANK_N, classify_intent as _classify_fn,
+        ollama_available, rerank as _rerank_fn,
+    )
+    LLM_IMPORT_OK = True
+except Exception:
+    MAX_LLM_CALLS = 0
+    RERANK_N = 200
+    _rerank_fn = None
+    _classify_fn = None
+    ollama_available = None
+    LLM_IMPORT_OK = False
 
 
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.IGNORECASE)
@@ -47,6 +62,11 @@ CONFIRMED_AXIS_BOOST = 1.5
 PROFILE_SEED_BOOST = 0.5
 SWITCH_SLOTS = 2
 CONVERGE_COUNT = 25
+GENERIC_CATEGORY_WORDS = {
+    "men", "women", "mens", "womens", "man", "woman", "unisex", "kid", "kids",
+    "boys", "girls", "baby", "toddler", "fashion", "clothing", "apparel",
+    "accessories", "shoes", "wear",
+}
 
 
 def _text(value: object) -> str:
@@ -92,8 +112,31 @@ class Agent:
         self.catalog_path = Path(catalog_path)
         self.connection = sqlite3.connect(":memory:")
         self._sessions: dict[str, dict] = {}
+        self._products: dict[str, dict] = {}
+        self._llm_available = (
+            os.environ.get("TECHJAM_NO_LLM", "0") != "1"
+            and LLM_IMPORT_OK
+            and ollama_available is not None
+            and ollama_available()
+        )
+        if not self._llm_available:
+            print("[agent] LLM reranker DISABLED (ollama unreachable or TECHJAM_NO_LLM set) - running deterministic only.")
         self._build_index()
         self._build_idf()
+        self._build_type_words()
+
+    def _build_type_words(self) -> None:
+        # Catalog category vocabulary (with singulars), minus generic words. Used
+        # to detect product-type overrides (e.g. sneakers -> wallet).
+        words: set[str] = set()
+        for product in self._products.values():
+            for segment in product.get("categories") or []:
+                for term in _terms(segment):
+                    if term not in GENERIC_CATEGORY_WORDS:
+                        words.add(term)
+                        if term.endswith("s") and len(term) > 3:
+                            words.add(term[:-1])
+        self._type_words = words
 
     def _build_index(self) -> None:
         cursor = self.connection.cursor()
@@ -106,6 +149,7 @@ class Agent:
         with self.catalog_path.open(encoding="utf-8") as handle:
             for line in handle:
                 product = json.loads(line)
+                self._products[str(product["parent_asin"])] = product
                 batch.append(
                     (
                         str(product["parent_asin"]),
@@ -160,6 +204,8 @@ class Agent:
             "weights": weights,
             "pool": self._total,
             "distilled": None,
+            "llm_calls": 0,
+            "llm_intent": None,
         }
 
     def _add_constraint(self, state: dict, text: str, provisional: bool) -> None:
@@ -176,11 +222,6 @@ class Agent:
 
     def _absorb(self, state: dict, message: str) -> None:
         message = message.strip()
-        # ROUTING: an explicit requirement marker means BUYING; everything else
-        # (exploring openers, override openers with a stated preference) starts
-        # as BROWSING so a decoy preference is never locked as a hard constraint.
-        if "A key requirement is" in message:
-            state["track"] = "buying"
         if not state["category_terms"]:
             match = re.search(r"I'm looking for (.+?)[.,]", message)
             if match:
@@ -198,8 +239,23 @@ class Agent:
                     prose = match.group(1).strip()
                     if prose and not any(marker in prose for marker in ("still exploring", "I don't have")):
                         self._add_constraint(state, prose, provisional=True)
-            if state["track"] is None:
-                state["track"] = "browsing"
+            # INTENT DETECTION (Pillar I): the LLM classifies buying vs browsing
+            # from the opener text itself (real-world: no template assumptions).
+            # The deterministic heuristic is used ONLY when the LLM is unavailable.
+            if self._llm_available and _classify_fn is not None:
+                intent = _classify_fn(message)
+                llm_track = intent.get("intent")
+                requirement = intent.get("requirement")
+                state["llm_intent"] = llm_track
+                if llm_track == "buying":
+                    state["track"] = "buying"
+                    if requirement and not state["confirmed"]:
+                        self._add_constraint(state, requirement, provisional=True)
+                else:
+                    state["track"] = "browsing"
+            else:
+                state["llm_intent"] = None
+                state["track"] = "buying" if "A key requirement is" in message else "browsing"
         match = re.search(r"what matters is:\s*(.+)$", message)
         if match:
             for part in match.group(1).rstrip(".").split("; "):
@@ -227,6 +283,20 @@ class Agent:
                 state["confirmed"] = kept
                 state["confirmed_axis"] = {_classify(t) for t, _ in state["confirmed"]}
                 self._add_constraint(state, new_value, provisional=False)
+                # CATEGORY OVERRIDE (product-type jump): if the new intent names a
+                # short word from the catalog's category vocabulary (e.g. "wallet",
+                # "sneakers", "dress"), the customer changed product type. Drop
+                # everything and restart from the new intent. Attribute values
+                # (leather, Water Resistant) and long features never match.
+                new_terms = _terms(new_value)
+                if (flip_axis == "feature" and len(new_terms) <= 2 and new_terms
+                        and all(term in self._type_words for term in new_terms)):
+                    state["confirmed"] = []
+                    state["confirmed_axis"] = set()
+                    state["asked"] = set()
+                    state["exhausted"] = set()
+                    state["category_terms"] = new_terms
+                    self._add_constraint(state, new_value, provisional=False)
         match = re.search(r"I don't have an additional preference for (\w+)", message)
         if match:
             state["exhausted"].add(match.group(1))
@@ -261,7 +331,7 @@ class Agent:
             return self._total
         return int(row[0]) if row else 0
 
-    def _rank(self, state: dict, top_k: int) -> tuple[list[dict], int]:
+    def _entries(self, state: dict) -> list[list]:
         entries: list[list] = []
         if state["category_terms"]:
             terms = state["category_terms"]
@@ -272,6 +342,20 @@ class Agent:
                 continue
             distinctiveness = max(self._idf.get(t, 0.0) for t in terms)
             entries.append([distinctiveness, "(" + " OR ".join(f'"{t}"' for t in terms) + ")", True])
+        return entries
+
+    def _pool_asins(self, state: dict, limit: int) -> list[str]:
+        entries = self._entries(state)
+        while True:
+            active = [entry[1] for entry in entries if entry[2]]
+            candidates = self._execute(active, limit) if active else []
+            if candidates or len(active) <= 1:
+                return candidates
+            drop = min((entry for entry in entries if entry[2]), key=lambda entry: entry[0])
+            drop[2] = False
+
+    def _rank(self, state: dict, top_k: int) -> tuple[list[dict], int]:
+        entries = self._entries(state)
 
         best: list[str] = []
         while True:
@@ -295,6 +379,28 @@ class Agent:
         count = self._candidate_count(active) if active else self._total
         return [{"parent_asin": asin} for asin in best], count
 
+    def _max_confirmed_idf(self, state: dict) -> float:
+        best = 0.0
+        for text, _provisional in state["confirmed"]:
+            for term in _terms(text):
+                best = max(best, self._idf.get(term, 0.0))
+        return best
+
+    def _should_rerank(self, state: dict, pool: int, final_answer: bool) -> bool:
+        # LLM RERANK POLICY: optional, and only fires once ALL information has
+        # been gathered -- on the final recommendation (converged or turn >= 9),
+        # never mid-session. Degrades to pure deterministic if the LLM module is
+        # unavailable, ollama is not running, or TECHJAM_NO_LLM is set.
+        if not self._llm_available:
+            return False
+        if not final_answer:
+            return False
+        if pool <= 10:
+            return False
+        if len(state["confirmed"]) < 1:
+            return False
+        return True
+
     def _ask_score(self, state: dict, bucket: str) -> float:
         presence, distinctiveness = BUCKET_STATS[bucket]
         weight = state["weights"].get(bucket, 1.0)
@@ -316,6 +422,7 @@ class Agent:
         # LLM context (Dynamic Context Programming).
         return {
             "track": state["track"],
+            "llm_intent": state.get("llm_intent"),
             "category": " ".join(state["category_terms"]),
             "engaged_axes": sorted(state["confirmed_axis"]),
             "confirmed_count": len(state["confirmed"]),
@@ -330,6 +437,8 @@ class Agent:
         if not candidates:
             if "other" not in state["asked"] and "other" not in state["exhausted"]:
                 return "other"
+            if "budget" not in state["asked"] and "budget" not in state["exhausted"]:
+                return "budget"
             return None
         return max(candidates, key=lambda bucket: self._ask_score(state, bucket))
 
@@ -353,7 +462,15 @@ class Agent:
         state["pool"] = candidate_count
         state["distilled"] = self._distill(state)
         converged = len(state["confirmed"]) >= 2 and candidate_count <= CONVERGE_COUNT
-        ask_attribute = None if (turn >= 9 or converged) else self._next_ask(state)
+        final_answer = turn >= 9 or converged
+        if state["llm_calls"] < MAX_LLM_CALLS and self._should_rerank(state, candidate_count, final_answer):
+            pool = self._pool_asins(state, RERANK_N)
+            if len(pool) > top_k:
+                reranked = _rerank_fn(state, pool, self._products)
+                state["llm_calls"] += 1
+                if reranked:
+                    recommendations = [{"parent_asin": asin} for asin in reranked[:top_k]]
+        ask_attribute = None if final_answer else self._next_ask(state)
         if ask_attribute is not None:
             state["asked"].add(ask_attribute)
 
