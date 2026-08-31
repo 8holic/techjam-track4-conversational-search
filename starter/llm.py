@@ -1,3 +1,14 @@
+"""Optional local-LLM client (ollama) for the shopping agent.
+
+Two narrow LLM tasks, each with its own system prompt:
+  1. intent detection -- classify a session opener as BUYING or BROWSING.
+  2. semantic rerank -- re-order the BM25 candidate pool on the final answer.
+
+Every call is fail-safe: on any error (model down, timeout, unparseable
+output) the functions return a safe default (browsing / original pool), so
+the agent degrades to pure deterministic BM25 instead of crashing.
+"""
+
 from __future__ import annotations
 
 import json
@@ -9,8 +20,11 @@ LLM_URL = "http://localhost:11434/api/chat"
 LLM_TIMEOUT = 45
 LLM_TEMP = 0.2
 RERANK_N = 30
-MAX_LLM_CALLS = 2
+MAX_LLM_CALLS = 10
 
+# Intent classifier: firm requirement framing => BUYING; a bare attribute
+# mention or exploring => BROWSING (so an override-opener's stated preference
+# is treated as tentative, not a hard buying intent).
 SYSTEM_INTENT = (
     "You are a shopping-assistant intent classifier. Decide if a shopper is "
     "BUYING or BROWSING.\n"
@@ -26,6 +40,8 @@ SYSTEM_INTENT = (
     '"requirement": "the specific must-have requirement if clearly stated, else null"}'
 )
 
+# Semantic reranker: given the customer's context + numbered candidates,
+# output the top-10 by product number. The pool passed in is the BM25 top-N.
 SYSTEM_RERANK = (
     "You are a shopping-assistant reranker. Given the customer's situation and the "
     "candidate products, pick the product the customer most likely wants.\n"
@@ -72,7 +88,7 @@ def _prompt(state: dict, pool: list[str], products: dict) -> str:
     )
 
 
-def _chat(system: str, user: str) -> str:
+def _chat(system: str, user: str) -> tuple[str, int, int]:
     messages = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -91,33 +107,37 @@ def _chat(system: str, user: str) -> str:
     )
     with urllib.request.urlopen(request, timeout=LLM_TIMEOUT) as response:
         data = json.loads(response.read().decode("utf-8"))
-    return str(data.get("message", {}).get("content", ""))
+    content = str(data.get("message", {}).get("content", ""))
+    prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
+    completion_tokens = int(data.get("eval_count", 0) or 0)
+    return content, prompt_tokens, completion_tokens
 
 
-def classify_intent(message: str) -> dict:
+def classify_intent(message: str) -> tuple[dict, int, int]:
     """Classify a session opener as buying or browsing (+ optional requirement).
-    Returns {"intent": "buying"|"browsing", "requirement": str|None}; returns a
-    safe browsing default on any failure."""
+    Returns ({"intent": "buying"|"browsing", "requirement": str|None}, prompt,
+    completion). Falls back to a safe browsing default on any failure."""
     try:
-        raw = _chat(SYSTEM_INTENT, f"Customer message: {message}")
+        raw, prompt_tokens, completion_tokens = _chat(SYSTEM_INTENT, f"Customer message: {message}")
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if match:
             data = json.loads(match.group(0))
             intent = str(data.get("intent", "")).lower().strip()
             requirement = data.get("requirement")
             if intent in ("buying", "browsing"):
-                return {"intent": intent, "requirement": str(requirement) if requirement else None}
-        return {"intent": "browsing", "requirement": None}
+                return ({"intent": intent, "requirement": str(requirement) if requirement else None},
+                        prompt_tokens, completion_tokens)
+        return {"intent": "browsing", "requirement": None}, prompt_tokens, completion_tokens
     except Exception:
-        return {"intent": "browsing", "requirement": None}
+        return {"intent": "browsing", "requirement": None}, 0, 0
 
 
-def rerank(state: dict, pool: list[str], products: dict) -> list[str]:
-    """Semantically re-rank the BM25 candidate pool. Returns the reordered
-    pool, or the ORIGINAL pool unchanged on any failure (model down, timeout,
-    unparseable output)."""
+def rerank(state: dict, pool: list[str], products: dict) -> tuple[list[str], int, int]:
+    """Semantically re-rank the BM25 candidate pool. Returns (reordered pool,
+    prompt, completion); the pool is returned unchanged on any failure (model
+    down, timeout, unparseable output)."""
     try:
-        raw = _chat(SYSTEM_RERANK, _prompt(state, pool, products))
+        raw, prompt_tokens, completion_tokens = _chat(SYSTEM_RERANK, _prompt(state, pool, products))
         seen: set[str] = set()
         ordered: list[str] = []
         for number in re.findall(r"\d+", raw):
@@ -129,6 +149,6 @@ def rerank(state: dict, pool: list[str], products: dict) -> list[str]:
             if asin not in seen:
                 seen.add(asin)
                 ordered.append(asin)
-        return ordered
+        return ordered, prompt_tokens, completion_tokens
     except Exception:
-        return pool
+        return pool, 0, 0

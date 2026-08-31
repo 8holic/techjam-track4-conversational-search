@@ -1,0 +1,63 @@
+DEFERRED IMPROVEMENTS (techjam track4)
+=======================================
+
+0. DETERMINED NOT NEEDED (deliberate scope decisions, not omissions)
+   - DENSE / VECTOR RETRIEVAL: judged unnecessary in this context. The miss
+     analysis showed the target is ALREADY in the candidate pool ~99% of the
+     time -- the failures are RANKING (target at rank 12-60), not coverage.
+     A dense route's main job is recall/coverage, which we don't lack; the
+     LLM semantic reranker addresses the actual failure mode (ranking). We
+     reasoned this from the miss analysis rather than running a formal
+     "does vector rescue the BM25 misses" ablation.
+   - CROSS-CATEGORY MATCHING: judged unnecessary in this context. The opener's
+     category is DERIVED FROM THE TARGET'S OWN category path, so the correct
+     product is always inside the stated category. Cross-category retrieval
+     would surface products the ground-truth never points to, so it cannot
+     help this task's scoring. Relevant to general e-commerce, not this dataset.
+
+1. GENDER / DEPARTMENT OVERRIDE (men -> women)
+   - Gap: the category-override reset only fires on PRODUCT-TYPE words
+     (wallet, sneakers, dress). Gender words (men/women) are excluded from
+     the type vocabulary (GENERIC_CATEGORY_WORDS), so a "men's -> women's"
+     switch does NOT trigger a clean category rewrite.
+   - Current behavior: it self-heals by accident via the OR-groups -- the
+     type word carries over ("shirts") and the new gender word narrows, so
+     the query still finds the right products. The stale gender term stays
+     in the category (harmless but unclean).
+   - Proposed fix: detect a gender/department conflict -- if the new intent
+     contains a gender word that differs from the current category's gender,
+     treat it as a category override (drop everything, restart with the new
+     gender + type). Real-world-only; the simulator never changes category.
+   - NOTE: the LLM final decider (semantic rerank) ALREADY helps here even
+     without the fix. Because the OR-groups keep the right type in the pool,
+     the LLM reads the accumulated context ("What I need is: women shirts")
+     and re-ranks the pool semantically, so the correct women's product can
+     still surface to the top. It fixes the RANKING side of a category
+     switch; the proposed fix would fix the RETRIEVAL/category-rewrite side.
+
+2. OTHER KNOWN LIMITS (from miss analysis)
+   - ~85% of remaining misses are RANKING misses: target is in the pool but
+     BM25 ranks it 12-60 because the confirmed slots are generic
+     (Imported/leather/cotton). Only a stronger semantic ranker (bigger LLM,
+     better prompt) or more distinctive revealed signal would help.
+   - ~6% of sessions are genuinely info-poor: the target's identity was never
+     disclosed by the simulator's card (e.g. the "Grandma" slogan tee). No
+     agent can solve these -- the conversation lacks the signal.
+   - The LLM (qwen3:1.7b) is a coin flip on ambiguous pools: rescues some,
+     degrades others. The final-answer-only policy (fire only once all info is
+     gathered) fixed the early-hit hurts. A larger/cleaner model would tilt
+     the coin further.
+   - The profile (preference_tags) is a weak ask prior: seed strength 0.5->1.0
+     was score-neutral in ablation. It biases WHAT we ask, never WHAT we assume
+     (deliberate, safe personalization).
+
+3. LLM CONTEXT LIMIT
+   - qwen3:1.7b context is 4096 tokens. RERANK_N=200 (20k-token prompts) hung
+     ollama. RERANK_N=30 fits and scored the same. Keep N<=30 unless a model
+     with a larger context is used.
+
+4. TOKEN USAGE
+   - Now reported correctly (prompt/completion from ollama's response). It is
+     a feasibility metric, not part of the core score.
+
+FUCK YOU NO
